@@ -8,9 +8,12 @@ Status as of 2026-09-27. Verified by running, not by inspection.
   `--list-backends` reports both installed engines. `DWB_BACKEND` or
   `--backend` overrides selection; an unknown name fails loudly.
 - `webkitgtk` backend renders real pages: correct colours, antialiased text,
-  via `webkit_web_view_get_snapshot`.
-- `chromium` backend completes a CDP handshake, navigates, and receives page
-  lifecycle events (`frameStartedNavigating` -> `frameStoppedLoading`).
+  read off the view's GdkWindow. Same engine as macOS WebKit, so this is the
+  fidelity backend.
+- `chromium` backend renders over CDP. Handshake, navigation, and frame capture
+  all verified against Chromium 153; frames come back as JPEG at the requested
+  size (800x600 for `--size 800x600`).
+- Both backends decode and play H.264 - see below.
 
 ## Verified working: H.264 playback
 
@@ -44,13 +47,14 @@ This is the answer to the question the whole proxy rests on, and it is positive.
    frame is sent to a guest, since a static frame is indistinguishable from a
    frozen video.
 
-3. **`chromium` receives no screencast frames.** `Page.startScreencast` is
-   accepted and `Page.screencastVisibilityChanged` arrives, but zero
-   `Page.screencastFrame` messages follow, so `render()` has nothing to return.
-   Suspect the conflicting `--ozone-platform` flags the launcher injects
-   (`wayland` from the system default plus `headless` from ours) producing a
-   zero-size surface. Needs `--screenshot`-based capture or an explicit
-   `Emulation.setDeviceMetricsOverride` before starting the cast.
+3. **`chromium` screencast is now decoded, but capture still goes through
+   `Page.captureScreenshot`.** Screencast frames were arriving all along with
+   valid JPEG data; they were being discarded because every drain passed a NULL
+   handler to `ws_pump`, which drops messages. Both that and a use-after-free in
+   `cr_wait_reply` are fixed, and the backend now renders and reports
+   `distinct_frames=2`. `render()` still prefers `captureScreenshot` for
+   on-demand grabs because it is request/reply and cannot silently stall the way
+   a push-based cast can; a screencast frame is used when one is buffered.
 
 4. **YouTube itself still does not start.** Metadata resolves (duration 213.1s,
    854x480, no error) and buffering works (31.6s then 42.3s buffered), but
