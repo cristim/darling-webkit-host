@@ -28,21 +28,25 @@ This is the answer to the question the whole proxy rests on, and it is positive.
 
 ## Open bugs
 
-1. **Window resize does not take effect, so frames are far larger than
-   requested.** `--size 640x480` yields a 1242x1500 view allocation (7.4MB).
-   `gtk_window_resize` after `show_all` is not shrinking the web view, and
-   `GDK_SCALE=1` does not help. Capture is now off the GdkWindow so it faithfully
-   reports the real allocation - which means this bug is now the only thing
-   standing between us and correctly-sized frames. Needs the window constrained
-   before the view is realised.
+1. **Capture fidelity is improved but playback is flaky.** Frames now change
+   during a watch window (`distinct_frames=3` over 8s, previously 1), so
+   `gdk_pixbuf_get_from_window` is sampling a current surface once pending
+   paints are pumped first. However the H.264 page played on one run
+   (`t=2.77 readyState=4`) and did not play at all on the next
+   (`readyState=0 w=0x0 dur=live buffered=0`). Same code, same URL. The media
+   stack is capable of playing (proven) but start-up is not reliable, so
+   "playback works" should be read as "playback can work", not "playback works".
 
-2. **Captured frames do not visibly change during playback.** With the same
-   H.264 page, `eval` shows `currentTime=2.77` and `readyState=4`, but
-   `distinct_frames=1` over 8s. Either the video region is not being captured,
-   or `gdk_pixbuf_get_from_window` returns a stale surface. Playback is proven;
-   *capture fidelity during playback* is not. This must be settled before any
-   frame is sent to a guest, since a static frame is indistinguishable from a
-   frozen video.
+2. **Frame size is device pixels, not logical.** `--size 640x480` yields a
+   1280x960 surface because the host display is HiDPI and GDK negotiates scale 2.
+   `GDK_SCALE=1` is set before GDK initialises but the compositor's own
+   advertisement wins. This is correct GTK behaviour rather than a bug, but the
+   frame header should carry both logical and device geometry so a guest can
+   scale, and callers must budget 4 bytes per device pixel.
+
+   This is already much better than before the GdkWindow capture change, where
+   the size was the page's full content size (2512x1500, 15MB) regardless of
+   the request.
 
 3. **`chromium` receives no screencast frames.** `Page.startScreencast` is
    accepted and `Page.screencastVisibilityChanged` arrives, but zero

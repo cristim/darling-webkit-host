@@ -25,6 +25,10 @@ typedef struct {
 
 	GdkPixbuf *snapshot; /* owned; valid until the next render() */
 	uint32_t seq;
+	/* Geometry the caller asked for, so render() can detect a WM that ignored
+	 * the request instead of silently shipping an oversized frame. */
+	int want_width;
+	int want_height;
 
 	gboolean load_finished;
 
@@ -68,8 +72,23 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
 		self->load_finished = TRUE;
 }
 
+/* Forces GDK scale 1 before GDK initialises. The host display is HiDPI, so a
+ * 640x480 logical view became a 1280x960 device-pixel surface - correct
+ * behaviour for GTK, but double the frame bytes a guest has to receive for no
+ * benefit. Set here because GDK_SCALE is only read during initialisation. */
+static void pin_gdk_scale(void)
+{
+	static gsize once = 0;
+	if (g_once_init_enter(&once)) {
+		g_setenv("GDK_SCALE", "1", TRUE);
+		g_setenv("GDK_DPI_SCALE", "1", TRUE);
+		g_once_init_leave(&once, 1);
+	}
+}
+
 static int wk_probe(void)
 {
+	pin_gdk_scale();
 	/* This backend is only compiled when pkg-config found webkit2gtk-4.1, so
 	 * reaching this function already proves the library exists. What can still
 	 * be missing at runtime is a display: WebKitGTK will not composite into a
@@ -80,6 +99,7 @@ static int wk_probe(void)
 
 static dwb_backend *wk_create(int width, int height, char **error)
 {
+	pin_gdk_scale();
 	if (!gtk_init_check(NULL, NULL)) {
 		set_error(error, "gtk_init_check failed (no display; try Xvfb)");
 		return NULL;
@@ -91,7 +111,16 @@ static dwb_backend *wk_create(int width, int height, char **error)
 
 	self->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_default_size(GTK_WINDOW(self->window), width, height);
+	/* The window must not be growable. set_default_size is only a request, and
+	 * the WM was free to hand back a 1242x1500 view for a 640x480 request,
+	 * which made every frame 7-15MB. A non-resizable window plus a hard size
+	 * request on the view makes the requested geometry the actual allocation,
+	 * which is what the guest will be told to display. */
+	gtk_window_set_resizable(GTK_WINDOW(self->window), FALSE);
 	self->view = WEBKIT_WEB_VIEW(webkit_web_view_new());
+	self->want_width = width;
+	self->want_height = height;
+	gtk_widget_set_size_request(GTK_WIDGET(self->view), width, height);
 
 	WebKitSettings *settings = webkit_web_view_get_settings(self->view);
 	if (settings) {
@@ -106,6 +135,10 @@ static dwb_backend *wk_create(int width, int height, char **error)
 	g_signal_connect(self->view, "load-changed", G_CALLBACK(on_load_changed), self);
 	gtk_container_add(GTK_CONTAINER(self->window), GTK_WIDGET(self->view));
 	gtk_widget_show_all(self->window);
+	/* Re-assert after mapping: the first allocation can still be pre-resize. */
+	gtk_window_resize(GTK_WINDOW(self->window), width, height);
+	gtk_window_move(GTK_WINDOW(self->window), 0, 0);
+	pump(120);
 
 	dwb_backend *backend = calloc(1, sizeof(*backend));
 	if (!backend) {
@@ -250,6 +283,11 @@ static int wk_render(dwb_backend *backend, dwb_frame *out, char **error)
 		          alloc.height);
 		return -1;
 	}
+
+	/* Let pending paints and video presents land before sampling, otherwise the
+	 * window still holds the previous frame. Without this a playing video
+	 * reported identical pixels across every sample. */
+	pump(40);
 
 	GdkPixbuf *pixbuf = gdk_pixbuf_get_from_window(
 		gdk_window, 0, 0, alloc.width, alloc.height);
