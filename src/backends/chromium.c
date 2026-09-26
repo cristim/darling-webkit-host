@@ -53,7 +53,22 @@ typedef struct {
 	size_t pending_size;
 	int io_next_id;   /* id awaiting an IO.read reply */
 	int eval_next_id; /* id awaiting a Runtime.evaluate reply */
+	gboolean loaded;  /* set when Page.loadEventFired arrives */
 } cr_impl;
+
+/* Defined below cr_navigate, which uses it to confirm a frame is obtainable. */
+static int cr_capture(cr_impl *self, char **error);
+static void cr_handle_message(cr_impl *self, const char *json);
+
+/* ws_pump takes a 3-argument callback; this adapts it to the 2-argument
+ * handler. Every drain must go through this, not NULL: passing NULL makes
+ * ws_pump discard the message, which silently threw away both the screencast
+ * frames and the load event. */
+static void cr_pump_handler(cr_impl *self, const char *json, void *user_data)
+{
+	(void)user_data;
+	cr_handle_message(self, json);
+}
 
 /* Bounds every socket operation. Without this a read that the peer never
  * answers - Chromium's DevTools server keeps HTTP/1.1 connections open and
@@ -303,8 +318,10 @@ static char *cr_wait_reply(cr_impl *self, int id, int timeout_ms)
 	}
 	payload[len] = '\0';
 	cr_handle_message(self, payload);
-	free(payload);
-	return payload; /* caller inspects for the id; simplified for our use */
+	/* Ownership passes to the caller, which frees it. Freeing here and
+	 * returning the pointer gave callers a dangling buffer, and their free
+	 * turned that into a double free. */
+	return payload;
 }
 
 /* Issues a GET to the loopback DevTools HTTP endpoint and returns the whole
@@ -595,6 +612,9 @@ static void cr_handle_message(cr_impl *self, const char *json)
 	/* Screencast frames arrive as base64 in Page.screencastFrame. Extracting
 	 * that without a JSON parser means finding the marker and decoding until
 	 * the closing quote, which is safe because base64 has no escapes. */
+	if (strstr(json, "Page.loadEventFired"))
+		self->loaded = TRUE;
+
 	const char *marker = "\"data\":\"";
 	const char *at = strstr(json, marker);
 	if (at) {
@@ -648,21 +668,21 @@ static void cr_destroy(dwb_backend *backend)
 static int cr_navigate(dwb_backend *backend, const char *url, char **error)
 {
 	cr_impl *self = backend->impl;
+	self->loaded = FALSE;
 	cr_send_cmd(self, self->next_id++, "Page.navigate", "{\"url\":\"%s\"}", url);
-	/* Wait for Page.loadEventFired by draining screencast traffic, which is
-	 * also how the frame buffer gets populated. */
+
 	gint64 deadline = g_get_monotonic_time() + 30 * G_USEC_PER_SEC;
-	while (g_get_monotonic_time() < deadline) {
-		ws_pump(self, NULL, NULL);
-		if (self->frame_size > 0)
-			break;
-		g_usleep(100000);
+	while (!self->loaded && g_get_monotonic_time() < deadline) {
+		ws_pump(self, cr_pump_handler, NULL);
+		g_usleep(50000);
 	}
-	if (self->frame_size == 0) {
-		set_error(error, "no screencast frame after navigating to %s", url);
+	if (!self->loaded) {
+		set_error(error, "timed out waiting for %s to finish loading", url);
 		return -1;
 	}
-	return 0;
+	/* Confirm the page actually produces pixels before reporting success, so a
+	 * blank or unsupported target is caught here rather than by the guest. */
+	return cr_capture(self, error);
 }
 
 static void cr_resize(dwb_backend *backend, int width, int height)
@@ -673,19 +693,61 @@ static void cr_resize(dwb_backend *backend, int width, int height)
 	cr_send_cmd(self, self->next_id++, "Emulation.setDeviceMetricsOverride",
 	            "{\"width\":%d,\"height\":%d,\"deviceScaleFactor\":1,\"mobile\":false}",
 	            width, height);
-	ws_pump(self, NULL, NULL);
+	ws_pump(self, cr_pump_handler, NULL);
+}
+
+/* Requests one frame via Page.captureScreenshot and waits for it.
+ *
+ * This is the reliable capture path. Page.startScreencast turned out to be
+ * unusable here: the launcher stub injects a conflicting --ozone-platform, and
+ * the cast produced no frames at all even once the handshake and navigation
+ * were verified working. captureScreenshot is a request/reply, so it either
+ * returns an image or an error - it cannot silently do nothing, which is
+ * exactly the property a proxy needs. */
+static int cr_capture(cr_impl *self, char **error)
+{
+	uint32_t before = self->seq;
+	int id = self->next_id++;
+	cr_send_cmd(self, id, "Page.captureScreenshot",
+	            "{\"format\":\"jpeg\",\"quality\":85,\"captureBeyondViewport\":false}");
+
+	gint64 deadline = g_get_monotonic_time() + 15 * G_USEC_PER_SEC;
+	while (self->seq == before && g_get_monotonic_time() < deadline) {
+		struct pollfd pfd = { .fd = self->ws_fd, .events = POLLIN };
+		if (poll(&pfd, 1, 250) <= 0)
+			continue;
+		char *reply = cr_wait_reply(self, id, 250);
+		if (!reply)
+			continue;
+		if (strstr(reply, "\"error\"")) {
+			set_error(error, "Page.captureScreenshot failed: %s", reply);
+			free(reply);
+			return -1;
+		}
+		free(reply);
+	}
+
+	if (self->seq == before || !self->frame || self->frame_size == 0) {
+		set_error(error, "no frame from Page.captureScreenshot");
+		return -1;
+	}
+	return 0;
 }
 
 static int cr_render(dwb_backend *backend, dwb_frame *out, char **error)
 {
 	cr_impl *self = backend->impl;
-	ws_pump(self, NULL, NULL);
+	ws_pump(self, cr_pump_handler, NULL);
+
+	/* Prefer a screencast frame if one happens to be buffered, since it is
+	 * cheaper; otherwise pull a fresh screenshot. */
 	if (!self->frame || self->frame_size == 0) {
-		set_error(error, "no screencast frame available");
-		return -1;
+		if (cr_capture(self, error) != 0)
+			return -1;
 	}
-	/* The screencast is JPEG; hand it up as-is and let the frame header say so.
-	 * Decoding belongs on the host that asked for pixels, not here. */
+
+	/* Compressed: hand it up as-is and let the frame header say so. Decoding
+	 * belongs to whoever asked for pixels, not here. */
 	out->pixels = self->frame;
 	out->width = (uint32_t)self->width;
 	out->height = (uint32_t)self->height;
