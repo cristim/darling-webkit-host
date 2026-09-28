@@ -259,6 +259,8 @@ static void ws_pump(cr_impl *self, void (*on_msg)(cr_impl *, const char *, void 
 	}
 }
 
+static int cr_send_cmd_raw(cr_impl *self, int id, const char *method, const char *params);
+
 static int cr_send_cmd(cr_impl *self, int id, const char *method, const char *params_fmt, ...)
 {
 	char buf[4096];
@@ -278,15 +280,72 @@ static int cr_send_cmd(cr_impl *self, int id, const char *method, const char *pa
 	return ws_send_frame(self->ws_fd, payload, strlen(payload));
 }
 
+/* Same, with the params object already built - used where the params contain a
+ * string too long or too awkward for a format argument, which is the case for
+ * every JavaScript expression. */
+static int cr_send_cmd_raw(cr_impl *self, int id, const char *method, const char *params)
+{
+	size_t need = strlen(params) + strlen(method) + 64;
+	char *payload = g_malloc0(need);
+	snprintf(payload, need, "{\"id\":%d,\"method\":\"%s\",\"params\":%s}",
+	         id, method, params);
+	int rc = ws_send_frame(self->ws_fd, payload, strlen(payload));
+	g_free(payload);
+	return rc;
+}
+
 /* Waits for the reply carrying `id`, running the message handler for everything
  * else (screencast frames, events) on the way. */
+/* True when the payload is a reply for exactly this id. Requires the digits
+ * after the colon to be followed by a non-digit, so 5 does not match 50. */
+static int cr_payload_has_id(const char *payload, int id)
+{
+	char pat[32];
+	snprintf(pat, sizeof(pat), "\"id\":");
+	const char *at = strstr(payload, pat);
+	while (at) {
+		const char *digits = at + strlen(pat);
+		char *endp = NULL;
+		long v = strtol(digits, &endp, 10);
+		/* A JSON id is a bare number: something non-digit, or the end, follows. */
+		if (endp && endp != digits && (!*endp || (*endp >= '0' && *endp <= '9') == 0)) {
+			if (v == (long)id)
+				return 1;
+		}
+		at = strstr(at + 1, pat);
+	}
+	return 0;
+}
+
+static char *cr_wait_reply_until(cr_impl *self, int id, int timeout_ms, gint64 deadline);
+
 static char *cr_wait_reply(cr_impl *self, int id, int timeout_ms)
 {
+	return cr_wait_reply_until(self, id, timeout_ms, g_get_monotonic_time() + timeout_ms * 1000);
+}
+
+/* cr_wait_reply discards every message that is not the reply it is waiting for,
+ * and on chromium a screencast frame arrives every few milliseconds for as long
+ * as the page is visible. The recursion passed the full timeout down each time,
+ * so a page that never stopped producing frames - which is every page with a
+ * video on it, i.e. the app this proxy exists for - reached the recursion tail
+ * before the deadline and evaluate() reported:
+ *
+ *     no reply to Runtime.evaluate
+ *
+ * for a command the browser had answered immediately. The deadline is now
+ * absolute and passed down, so discarding frames cannot extend the wait.
+ * Bounded as well: an unbounded tail call on a chatty socket is a stack risk
+ * independent of the timeout. */
+static char *cr_wait_reply_until(cr_impl *self, int id, int timeout_ms, gint64 deadline)
+{
+	int remaining = (int)((deadline - g_get_monotonic_time()) / 1000);
+	if (remaining <= 0)
+		return NULL;
 	struct pollfd pfd = { .fd = self->ws_fd, .events = POLLIN };
-	int pr = poll(&pfd, 1, timeout_ms);
+	int pr = poll(&pfd, 1, remaining);
 	if (pr <= 0)
 		return NULL;
-	/* One message is enough for the simple command/reply calls used here. */
 	unsigned char head[2];
 	if (read(self->ws_fd, head, 2) != 2)
 		return NULL;
@@ -318,6 +377,26 @@ static char *cr_wait_reply(cr_impl *self, int id, int timeout_ms)
 	}
 	payload[len] = '\0';
 	cr_handle_message(self, payload);
+
+	/* Only the reply carrying our id is the answer. Anything else on the socket
+	 * - a screencast frame, or a reply to an earlier or later command - must be
+	 * discarded, or evaluate() hands the guest a stale message.
+	 *
+	 * Matching is on the id as a complete number, not a substring. strstr("\"id\":5")
+	 * also matches \"id\":50 and \"id\":53, so waiting for reply 5 happily
+	 * consumed reply 50 instead, and the guest got another command's result:
+	 *
+	 *     1+1  rc=0 [description]
+	 *     document.querySelectorAll('p').length  rc=0 [description]
+	 *
+	 * - a successful call returning the wrong value, which is worse than an
+	 * error because nothing downstream can tell. Chromium's ids climb into the
+	 * hundreds on a page with a video, so the odds of hitting a neighbour are
+	 * high, exactly when it matters most. */
+	if (!cr_payload_has_id(payload, id)) {
+		free(payload);
+		return cr_wait_reply_until(self, id, timeout_ms, deadline);
+	}
 	/* Ownership passes to the caller, which frees it. Freeing here and
 	 * returning the pointer gave callers a dangling buffer, and their free
 	 * turned that into a double free. */
@@ -396,18 +475,128 @@ static char *devtools_http_get(int port, const char *path)
 }
 
 /* Pulls the value of a "key": "value" pair, starting the search at `from`. */
+/* Value of a JSON string field, or NULL.
+ *
+ * The previous version searched for the key, skipped to the next colon, and took
+ * whatever string appeared after that. For a Runtime.evaluate reply:
+ *
+ *     {"id":7,"result":{"result":{"type":"number","value":2,"description":"2"}}}
+ *
+ * it never looked at the fact that "value" here is the number 2. It walked past
+ * the colon to "description" and returned the string "2" - and for a numeric
+ * result it returned the description of some other field entirely, which is how
+ * 1+1 came back as "description":
+ *
+ *     1+1  rc=0 [description]
+ *
+ * A successful call with the wrong value, which is worse than an error because
+ * nothing downstream can detect it. The value has to be the one belonging to the
+ * key that was asked for, and only a string value can be returned here - a
+ * numeric or boolean result is not a JSON string, so it is left to the caller
+ * rather than fabricated.
+ */
 static char *json_string_value(const char *from, const char *key)
 {
 	const char *k = strstr(from, key);
 	if (!k)
 		return NULL;
 	k += strlen(key);
-	const char *colon = strchr(k, ':');
-	const char *open = colon ? strchr(colon + 1, '"') : NULL;
-	const char *close = open ? strchr(open + 1, '"') : NULL;
-	if (!open || !close)
+	/* Skip whitespace to the value. */
+	while (*k == ' ' || *k == '\t')
+		k++;
+	if (*k != ':')
 		return NULL;
-	return g_strndup(open + 1, (gsize)(close - open - 1));
+	k++;
+	while (*k == ' ' || *k == '\t')
+		k++;
+	/* A string value is quoted. Anything else is not a string, and guessing at
+	 * it is what produced the wrong answers. */
+	if (*k != '"')
+		return NULL;
+	k++;
+	const char *end = k;
+	while (*end && *end != '"') {
+		if (*end == '\\' && end[1])
+			end++;
+		end++;
+	}
+	if (*end != '"')
+		return NULL;
+
+	/* The raw slice still carries CDP's JSON escapes. Decoded here so a caller
+	 * sees the text the engine actually wrote: a thrown message with a newline
+	 * arrived as a literal backslash-n, which is the CDP encoding leaking
+	 * through into an error a human reads. A string result is affected too -
+	 * a document title containing a quote or a newline came back escaped. */
+	gsize raw = (gsize)(end - k);
+	char *raw_out = g_strndup(k, raw);
+	char *out = g_malloc0(raw + 1);
+	size_t w = 0;
+	for (size_t i = 0; i < raw; i++) {
+		if (raw_out[i] != '\\' || i + 1 >= raw) {
+			out[w++] = raw_out[i];
+			continue;
+		}
+		i++;
+		switch (raw_out[i]) {
+		case 'n': out[w++] = '\n'; break;
+		case 'r': out[w++] = '\r'; break;
+		case 't': out[w++] = '\t'; break;
+		case 'b': out[w++] = '\b'; break;
+		case 'f': out[w++] = '\f'; break;
+		case 'u': {
+			if (i + 4 >= raw) { out[w++] = raw_out[i]; break; }
+			char hex[5] = { raw_out[i+1], raw_out[i+2], raw_out[i+3], raw_out[i+4], 0 };
+			char *endp = NULL;
+			long v = strtol(hex, &endp, 16);
+			if (endp && *endp == 0 && v > 0 && v < 0x80) {
+				out[w++] = (char)v; i += 4; break;
+			}
+			if (endp && *endp == 0 && v >= 0x80 && v < 0x800) {
+				out[w++] = (char)(0xC0 | (v >> 6));
+				out[w++] = (char)(0x80 | (v & 0x3F)); i += 4; break;
+			}
+			if (endp && *endp == 0 && v >= 0x800 && v < 0x10000) {
+				out[w++] = (char)(0xE0 | (v >> 12));
+				out[w++] = (char)(0x80 | ((v >> 6) & 0x3F));
+				out[w++] = (char)(0x80 | (v & 0x3F)); i += 4; break;
+			}
+			out[w++] = raw_out[i];
+			break;
+		}
+		default: out[w++] = raw_out[i]; break;
+		}
+	}
+	out[w] = '\0';
+	g_free(raw_out);
+	return out;
+}
+
+/* A JSON value that is not a string: a number, true, false or null. Returns a
+ * malloc'd rendering, or NULL when the field holds a string or is absent. */
+static char *json_scalar_value(const char *from, const char *key)
+{
+	const char *k = strstr(from, key);
+	if (!k)
+		return NULL;
+	k += strlen(key);
+	while (*k == ' ' || *k == '\t')
+		k++;
+	if (*k != ':')
+		return NULL;
+	k++;
+	while (*k == ' ' || *k == '\t' || *k == '\n' || *k == '\r')
+		k++;
+	if (*k == '"' || *k == '{' || *k == '[' || *k == '\0')
+		return NULL;              /* not a scalar, or absent */
+	/* A scalar runs to the next comma, brace or whitespace. */
+	const char *end = k;
+	while (*end && *end != ',' && *end != '}' && *end != ' ' && *end != '\n' &&
+	       *end != '\r' && *end != ']')
+		end++;
+	if (end == k)
+		return NULL;
+	return g_strndup(k, (gsize)(end - k));
 }
 
 static dwb_backend *cr_create(int width, int height, char **error)
@@ -665,11 +854,49 @@ static void cr_destroy(dwb_backend *backend)
 	free(backend);
 }
 
-static int cr_navigate(dwb_backend *backend, const char *url, char **error)
+static int cr_navigate(dwb_backend *backend, const char *url, char **error,
+                      dwb_response *out)
 {
+	/* A response is not captured on this backend. It is left empty rather than
+	 * refused: the guest treats an absent response as unknown, and this backend
+	 * refuses message handlers outright, so a delegate that needs the response
+	 * has nothing to do here anyway. Filling it in with a guess would be worse
+	 * than reporting nothing. */
+	if (out) {
+		out->url = NULL;
+		out->mime = NULL;
+		out->status = 0;
+	}
 	cr_impl *self = backend->impl;
 	self->loaded = FALSE;
-	cr_send_cmd(self, self->next_id++, "Page.navigate", "{\"url\":\"%s\"}", url);
+	int nav_id = self->next_id++;
+	cr_send_cmd(self, nav_id, "Page.navigate", "{\"url\":\"%s\"}", url);
+
+	/* Page.navigate answers with errorText when the navigation itself fails
+	 * (net::ERR_NAME_NOT_RESOLVED and friends). Chromium still paints an error
+	 * page and still fires loadEventFired, so without reading this reply an
+	 * unreachable host looks exactly like a successful load - the same defect
+	 * the webkitgtk backend had, where WEBKIT_LOAD_FINISHED covers both cases. */
+	char *nav_reply = cr_wait_reply(self, nav_id, 15000);
+	if (nav_reply) {
+		const char *err = strstr(nav_reply, "\"errorText\"");
+		if (err) {
+			const char *open = strchr(err, ':');
+			char detail[256] = "navigation failed";
+			if (open) {
+				const char *v = strchr(open + 1, '"');
+				const char *close = v ? strchr(v + 1, '"') : NULL;
+				if (v && close && (size_t)(close - v - 1) < sizeof(detail)) {
+					memcpy(detail, v + 1, (size_t)(close - v - 1));
+					detail[close - v - 1] = '\0';
+				}
+			}
+			set_error(error, "%s: %s", url, detail);
+			free(nav_reply);
+			return -1;
+		}
+		free(nav_reply);
+	}
 
 	gint64 deadline = g_get_monotonic_time() + 30 * G_USEC_PER_SEC;
 	while (!self->loaded && g_get_monotonic_time() < deadline) {
@@ -761,16 +988,121 @@ static int cr_evaluate(dwb_backend *backend, const char *js, char **value, char 
 {
 	cr_impl *self = backend->impl;
 	int id = self->next_id++;
-	cr_send_cmd(self, id, "Runtime.evaluate", "{\"expression\":\"%s\",\"returnByValue\":true}", js);
+	/* The expression is escaped before it goes into the CDP command. It was
+	 * interpolated raw, so any script containing a quote - that is, every
+	 * script containing JSON, and every string literal with an apostrophe in it
+	 * - produced malformed JSON, and the browser rejected the command:
+	 *
+	 *     no reply to Runtime.evaluate
+	 *
+	 * for a script that was never sent. The error names the transport, so it
+	 * reads like a hung browser rather than a quoting problem.
+	 *
+	 * The buffer is raised to 256K for the same reason as the client's: an
+	 * escaped expression is several times the length of the original. */
+	{
+		size_t worst = 0;
+		for (const unsigned char *p = (const unsigned char *)js; *p; p++)
+			worst += (*p == '"' || *p == '\\' || *p < 0x20) ? 6 : 1;
+		if (worst + 128 >= 262144) {
+			set_error(error, "expression too large to send");
+			return -1;
+		}
+		char *params = g_malloc0(worst + 128);
+		char *w = params;
+		w += sprintf(w, "{\"expression\":\"");
+		for (const unsigned char *p = (const unsigned char *)js; *p; p++) {
+			switch (*p) {
+			case '"':  memcpy(w, "\\\"", 2); w += 2; break;
+			case '\\': memcpy(w, "\\\\", 2); w += 2; break;
+			case '\n': memcpy(w, "\\n", 2); w += 2; break;
+			case '\r': memcpy(w, "\\r", 2); w += 2; break;
+			case '\t': memcpy(w, "\\t", 2); w += 2; break;
+			case '\b': memcpy(w, "\\b", 2); w += 2; break;
+			case '\f': memcpy(w, "\\f", 2); w += 2; break;
+			default:
+				if (*p < 0x20)
+					w += sprintf(w, "\\u%04x", *p);
+				else
+					*w++ = (char)*p;
+				break;
+			}
+		}
+		w += sprintf(w, "\",\"returnByValue\":true}");
+		cr_send_cmd_raw(self, id, "Runtime.evaluate", params);
+		g_free(params);
+	}
 	char *reply = cr_wait_reply(self, id, 15000);
 	if (!reply) {
 		set_error(error, "no reply to Runtime.evaluate");
 		return -1;
 	}
-	const char *res = strstr(reply, "\"result\"");
+	/* Extract the JS value, not a fragment of the CDP reply. The webkitgtk
+	 * backend returns a clean string for the same call, and a guest decoding
+	 * the protocol cannot special-case one backend's shape - it would have to
+	 * parse nested CDP JSON on one path and not the other.
+	 * Runtime.evaluate with returnByValue answers one of:
+	 *   {"id":N,"result":{"result":{"type":"string","value":"..."}}}
+	 *   {"id":N,"result":{"result":{"type":"number","value":2,"description":"2"}}}
+	 * so a string value is extracted when there is one, and a bare number is
+	 * read from the unquoted value otherwise.
+	 *
+	 * Returning "" for a numeric result - which is what happened once the
+	 * extraction stopped guessing - made every numeric evaluation look like it
+	 * produced nothing, and the app reads numbers back. So the number is read
+	 * properly rather than treated as a missing value. */
+	/* A thrown script answers with an exceptionDetails object and no value:
+	 *
+	 *   {"id":N,"result":{"result":{...},"exceptionDetails":{...}}}
+	 *
+	 * Reporting that as a successful empty string is a lie - a call that threw
+	 * looked like a call that returned nothing - so the exception is checked
+	 * first and its description becomes the error. */
+	if (strstr(reply, "\"exceptionDetails\"")) {
+		char *desc = json_string_value(reply, "\"description\"");
+		if (!desc)
+			desc = json_string_value(reply, "\"value\"");
+		set_error(error, "%s", desc ? desc : "javascript threw");
+		free(desc);
+		free(reply);
+		return -1;
+	}
+
+	char *js_value = json_string_value(reply, "\"value\"");
+	if (!js_value) {
+		char *vnum = json_scalar_value(reply, "\"value\"");
+		js_value = vnum;
+	}
 	if (value)
-		*value = g_strdup(res ? res : "");
+		*value = js_value ? js_value : g_strdup("");
+	else
+		g_free(js_value);
 	free(reply);
+	return 0;
+}
+
+static void cr_wait(dwb_backend *backend, int ms)
+{
+	/* The page lives in the browser process, which has its own loop, so here
+	 * waiting really is just waiting. */
+	(void)backend;
+	g_usleep((guint64)ms * 1000);
+}
+
+static int cr_add_script(dwb_backend *backend, const char *js, int at_document_start,
+                         int main_only, char **error)
+{
+	cr_impl *self = backend->impl;
+	/* Page.addScriptToEvaluateOnNewDocument is the document-start injection.
+	 * There is no equivalent of a document-end injection over CDP, so that case
+	 * is reported rather than silently doing the wrong thing. */
+	if (!at_document_start) {
+		set_error(error, "chromium backend only supports document-start injection");
+		return -1;
+	}
+	(void)main_only;
+	cr_send_cmd(self, self->next_id++, "Page.addScriptToEvaluateOnNewDocument",
+	            "{\"source\":\"%s\"}", js);
 	return 0;
 }
 
@@ -784,4 +1116,6 @@ const dwb_backend_ops dwb_backend_chromium = {
 	.resize = cr_resize,
 	.render = cr_render,
 	.evaluate = cr_evaluate,
+	.wait = cr_wait,
+	.add_script = cr_add_script,
 };

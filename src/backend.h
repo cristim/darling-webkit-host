@@ -14,6 +14,16 @@ typedef struct dwb_backend dwb_backend;
 
 /* A decoded frame the host wants to hand to the guest. Pixels are owned by the
  * backend and stay valid until the next call on that backend. */
+/* The main resource's response, filled in by navigate. Every field is optional:
+ * a backend that cannot report one leaves them NULL/0, and the guest treats that
+ * as unknown rather than as a failed load. Separate from dwb_frame because a
+ * response is about the load and a frame is about the pixels. */
+typedef struct {
+	char *url;      /* the final URL, after redirects; caller frees */
+	char *mime;     /* Content-Type, or NULL */
+	int status;     /* HTTP status, or 0 if not reported */
+} dwb_response;
+
 typedef struct {
 	void *pixels;
 	uint32_t width;
@@ -35,8 +45,12 @@ typedef struct {
 	dwb_backend *(*create)(int width, int height, char **error);
 	void (*destroy)(dwb_backend *backend);
 
-	/* Returns 0 on success, non-zero on failure with *error set (caller frees). */
-	int (*navigate)(dwb_backend *backend, const char *url, char **error);
+	/* The main resource's response, filled in by navigate. Every field is
+
+	/* Returns 0 on success, non-zero on failure with *error set (caller frees).
+	 * `out`, when given, receives the response for the load just performed. */
+	int (*navigate)(dwb_backend *backend, const char *url, char **error,
+	                dwb_response *out);
 	void (*resize)(dwb_backend *backend, int width, int height);
 
 	/* Renders the current state into `out`. The frame stays valid until the
@@ -47,6 +61,30 @@ typedef struct {
 	 * caller frees. On failure *error is set. Either may be NULL if the caller
 	 * does not want it. */
 	int (*evaluate)(dwb_backend *backend, const char *js, char **value, char **error);
+
+	/* Gives the page `ms` of wall time. A backend whose engine is main-loop
+	 * bound has to iterate that loop here rather than sleep: WebKitGTK cannot
+	 * open a GStreamer pipeline, answer IPC or run a script while its loop is
+	 * not turning, so a plain sleep hands the page no time at all. A backend
+	 * whose page lives in another process can just sleep. */
+	void (*wait)(dwb_backend *backend, int ms);
+
+	/* Installs a script to run before the page's own scripts. Needed by any
+	 * client that uses a WKUserContentController, which is how a webview is
+	 * normally instrumented. `main_only` mirrors
+	 * WKUserScript's forMainFrameOnly. */
+	int (*add_script)(dwb_backend *backend, const char *js, int at_document_start,
+	                  int main_only, char **error);
+
+	/* Named message handler, the other half of what a
+	 * WKUserContentController client installs. The page calls into the host
+	 * through it; the host queues what arrives and the guest drains the queue by
+	 * polling. Polling rather than pushing because the protocol is strict
+	 * request/response, and an unsolicited host->guest message would land where
+	 * the guest expects a reply and desynchronise the stream. */
+	int (*add_handler)(dwb_backend *backend, const char *name, char **error);
+	int (*poll_message)(dwb_backend *backend, const char *name, char **body,
+	                    char **error);
 } dwb_backend_ops;
 
 struct dwb_backend {

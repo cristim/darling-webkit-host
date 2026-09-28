@@ -18,6 +18,8 @@
 #include "backend.h"
 #include "protocol.h"
 
+int dwb_serve(const char *socket_path, const char *backend_name, int width, int height);
+
 /* --- --list-backends ---------------------------------------------------- */
 
 static int cmd_list_backends(void)
@@ -66,7 +68,8 @@ static int cmd_render(const char *url, const char *out_path, const char *backend
 		return 3;
 	}
 
-	if (ops->navigate(backend, url, &error) != 0) {
+	/* No response wanted on this path: it renders once and exits. */
+	if (ops->navigate(backend, url, &error, NULL) != 0) {
 		fprintf(stderr, "navigate failed: %s\n", error ? error : "unknown");
 		g_free(error);
 		ops->destroy(backend);
@@ -75,9 +78,11 @@ static int cmd_render(const char *url, const char *out_path, const char *backend
 	printf("navigated=%s\n", url);
 
 	/* Settle time before probing, so slow-starting players (YouTube especially)
-	 * have a chance to reach a playing state before anything is measured. */
+	 * have a chance to reach a playing state before anything is measured. Goes
+	 * through the backend rather than g_usleep: for a main-loop-bound engine a
+	 * sleep hands the page no time at all. */
 	if (eval_wait_ms > 0) {
-		g_usleep((guint64)eval_wait_ms * 1000);
+		ops->wait(backend, eval_wait_ms);
 		printf("settled_ms=%d\n", eval_wait_ms);
 	}
 
@@ -113,7 +118,7 @@ static int cmd_render(const char *url, const char *out_path, const char *backend
 	if (watch_ms > 0) {
 		int elapsed = 0;
 		while (elapsed < watch_ms) {
-			g_usleep(250000);
+			ops->wait(backend, 250);
 			elapsed += 250;
 			if (ops->render(backend, &frame, &error) != 0)
 				break;
@@ -171,23 +176,7 @@ static int cmd_render(const char *url, const char *out_path, const char *backend
 
 static int cmd_serve(const char *socket_path, const char *backend_name, int width, int height)
 {
-	char *error = NULL;
-	const dwb_backend_ops *ops = dwb_backend_select(backend_name, &error);
-	if (!ops) {
-		fprintf(stderr, "no backend: %s\n", error ? error : "unknown");
-		g_free(error);
-		return 2;
-	}
-	printf("backend=%s socket=%s\n", ops->name, socket_path);
-	fflush(stdout);
-
-	/* The socket half is intentionally not implemented yet: the guest side of
-	 * the proxy is blocked on spikes 0.1-0.3 (AF_UNIX reachability, shared
-	 * memory, and guest-side compositing). Until those pass, shipping a
-	 * half-wired server would be code no caller can exercise. */
-	fprintf(stderr,
-	        "serve mode is not wired up yet; run the guest-side spikes first\n");
-	return 7;
+	return dwb_serve(socket_path, backend_name, width, height);
 }
 
 static void usage(const char *argv0)
