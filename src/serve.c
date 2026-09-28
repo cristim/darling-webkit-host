@@ -42,6 +42,7 @@ typedef struct {
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <gio/gio.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -305,6 +306,13 @@ static int serve_client(int client, const dwb_backend_ops *ops, dwb_backend *bac
 			fprintf(stderr, "oversized payload %u, dropping guest\n", h.length);
 			return 1;
 		}
+		/* `>=`, not `>`: the terminator below writes at index h.length, so a
+		 * payload exactly filling this buffer wrote one byte past the end of a
+		 * 256 KB stack allocation. */
+		if (h.length >= sizeof(payload)) {
+			fprintf(stderr, "oversized payload %u, dropping guest\n", h.length);
+			return 1;
+		}
 		if (h.length && recv_all(client, payload, h.length) != 0)
 			return 0;
 		payload[h.length] = '\0';
@@ -457,6 +465,32 @@ static int serve_client(int client, const dwb_backend_ops *ops, dwb_backend *bac
 				send_msg(client, DWB_MSG_EVENT, ev, (uint32_t)strlen(ev));
 				break;
 			}
+			/* Map only what the file actually is. The guest names the size, and
+			 * mmap happily maps past the end of the file: the mapping succeeds
+			 * and the first access beyond it raises SIGBUS, which kills the host
+			 * rather than the guest. A guest asking for more than the file holds
+			 * is a bug in the guest, and the fix is to refuse it, not to crash.
+			 *
+			 * st_size can legitimately be smaller than what the guest asked for
+			 * if the file was created shorter, so the smaller of the two is what
+			 * both sides must agree on, and the guest is told that size. */
+			{
+				struct stat st;
+				if (fstat(sfd, &st) != 0) {
+					close(sfd);
+					send_msg(client, DWB_MSG_EVENT,
+					         "{\"name\":\"error\",\"detail\":\"shm fstat failed\"}", 45);
+					break;
+				}
+				if ((size_t)st.st_size < bytes)
+					bytes = (size_t)st.st_size;
+				if (bytes == 0) {
+					close(sfd);
+					send_msg(client, DWB_MSG_EVENT,
+					         "{\"name\":\"error\",\"detail\":\"shm file is empty\"}", 44);
+					break;
+				}
+			}
 			void *map = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
 			close(sfd);
 			if (map == MAP_FAILED) {
@@ -520,7 +554,15 @@ static int serve_client(int client, const dwb_backend_ops *ops, dwb_backend *bac
 			 * would arrive where the guest expects a reply and desynchronise
 			 * the stream, so the callback path is pull-based by design. */
 			char name[256];
-			json_get_string(payload, "name", name, sizeof(name));
+			if (json_get_string(payload, "name", name, sizeof(name)) != 0) {
+				/* The return value was ignored, so a request with no usable
+				 * name polled an uninitialised stack buffer - an arbitrary
+				 * channel name built from whatever was on the stack. Refuse
+				 * instead. */
+				send_msg(client, DWB_MSG_EVENT,
+				         "{\"name\":\"error\",\"detail\":\"poll needs a channel name\"}", 53);
+				break;
+			}
 			char *body = NULL, *perr = NULL;
 			if (!ops->poll_message || ops->poll_message(backend, name, &body, &perr) != 0) {
 				send_msg(client, DWB_MSG_EVENT,

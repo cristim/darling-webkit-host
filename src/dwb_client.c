@@ -9,6 +9,16 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+/* The largest payload the host ever sends, and so the buffer every reply reader
+ * needs. The host caps its envelopes at 256 KB and a polled body at 65535, so
+ * this is sized to the body plus room for the envelope around it. A reply reader
+ * smaller than this truncates a legitimate reply, and recv_msg now refuses rather
+ * than truncating, which turns "a bit too small" into a hard failure. */
+#define DWB_MAX_REPLY 131072
+
+/* A navigation or handler event: the host caps these at 8192 bytes. */
+#define DWB_MAX_EVENT 16384
+
 static int send_all(int fd, const void *buf, size_t len)
 {
 	const unsigned char *p = buf;
@@ -60,8 +70,27 @@ static int recv_msg(dwb_client *c, dwb_header *h, char *payload, size_t cap)
 		return -1;
 	if (h->magic != DWB_MAGIC || h->version != DWB_PROTO_VERSION)
 		return -1;
-	if (h->length > cap)
+	/* `>= cap`, not `> cap`: the terminator below writes at index h->length, so
+	 * a payload that exactly fills the buffer wrote one byte past the end of the
+	 * caller's allocation. Every caller passes sizeof(buf), which is exactly the
+	 * size that made this reachable. */
+	if (h->length >= cap) {
+		/* Drain before refusing. Leaving the bytes on the socket desynchronises
+		 * the stream permanently: the next call reads payload bytes as a header
+		 * and every later request fails, which reads like a dead host rather than
+		 * like one oversized reply. */
+		char sink[4096];
+		uint32_t left = h->length;
+		while (left) {
+			size_t want = left < sizeof(sink) ? (size_t)left : sizeof(sink);
+			if (recv_all(c->fd, sink, want) != 0)
+				return -1;
+			left -= (uint32_t)want;
+		}
+		snprintf(c->error, sizeof(c->error),
+		         "reply too large (%u bytes, max %zu)", h->length, cap - 1);
 		return -1;
+	}
 	if (h->length && recv_all(c->fd, payload, h->length) != 0)
 		return -1;
 	payload[h->length] = '\0';
@@ -215,7 +244,11 @@ int dwb_client_navigate(dwb_client *c, const char *url)
 		return -1;
 	if (send_msg(c, DWB_MSG_NAVIGATE, msg, (uint32_t)n) != 0)
 		return -1;
-	char buf[4096];
+	/* A navigation event, not a body. The host's largest is an error event at
+	 * 8192 bytes, so 4 KB was too small and would have failed a long error -
+	 * and recv_msg now refuses rather than truncating, which turns a buffer that
+	 * is merely small into a hard failure. */
+	char buf[DWB_MAX_EVENT];
 	dwb_header h;
 	if (recv_msg(c, &h, buf, sizeof(buf)) != 0)
 		return -1;
@@ -583,7 +616,7 @@ int dwb_client_poll_message(dwb_client *c, const char *name, char **body)
 	}
 	if (send_msg(c, DWB_MSG_POLL_MESSAGE, msg, (uint32_t)n) != 0)
 		return -1;
-	char buf[4096];
+		char buf[DWB_MAX_REPLY];
 	dwb_header h;
 	if (recv_msg(c, &h, buf, sizeof(buf)) != 0)
 		return -1;
@@ -601,7 +634,13 @@ int dwb_client_frame(dwb_client *c, dwb_frame_header *out, const void **pixels,
                      size_t *pixel_bytes, void **shm_map, size_t *shm_size,
                      int *in_shm)
 {
-	char *buf = malloc(sizeof(dwb_frame_header));
+	/* Capacity must be the real allocation size. This declared 4096 for a
+	 * 32-byte malloc, so any peer sending more than 32 bytes wrote past the end
+	 * of the heap block - on the frame path, the hottest path there is. */
+	/* One byte more than the header: recv_msg needs room for the NUL it writes
+	 * after the payload, and with exactly sizeof(dwb_frame_header) a 32-byte
+	 * header filled the buffer and was refused as oversized. */
+	char *buf = malloc(sizeof(dwb_frame_header) + 1);
 	if (!buf)
 		return -1;
 	if (send_msg(c, DWB_MSG_FRAME, NULL, 0) != 0) {
@@ -609,7 +648,7 @@ int dwb_client_frame(dwb_client *c, dwb_frame_header *out, const void **pixels,
 		return -1;
 	}
 	dwb_header h;
-	if (recv_msg(c, &h, buf, 4096) != 0) {
+	if (recv_msg(c, &h, buf, sizeof(dwb_frame_header) + 1) != 0) {
 		free(buf);
 		return -1;
 	}
