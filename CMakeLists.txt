@@ -13,6 +13,7 @@ pkg_check_modules(GTK3 REQUIRED IMPORTED_TARGET gtk+-3.0)
 add_executable(darling-webkit-host
 	src/main.c
 	src/registry.c
+	src/serve.c
 )
 
 target_include_directories(darling-webkit-host PRIVATE src)
@@ -44,3 +45,15 @@ endif()
 target_compile_options(darling-webkit-host PRIVATE
 	-Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations
 )
+
+# Portable guest transport and its test. Kept in this tree so the guest half
+# can be exercised off-target; WKWebView.m is a thin shell over it.
+add_library(dwb_client STATIC src/dwb_client.c)
+target_include_directories(dwb_client PUBLIC src)
+target_link_libraries(dwb_client PUBLIC glib-2.0)
+
+add_executable(clienttest clienttest.c)
+target_link_libraries(clienttest PRIVATE dwb_client)
+
+add_executable(shmtest shmtest.c)
+target_link_libraries(shmtest PRIVATE dwb_client)
