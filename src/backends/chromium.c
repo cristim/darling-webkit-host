@@ -54,7 +54,18 @@ typedef struct {
 	int io_next_id;   /* id awaiting an IO.read reply */
 	int eval_next_id; /* id awaiting a Runtime.evaluate reply */
 	gboolean loaded;  /* set when Page.loadEventFired arrives */
+	/* Script-message channels the guest registered. Chromium has no addHandler, so
+	 * the binding is installed with Runtime.addBinding and messages arrive as
+	 * Runtime.bindingCalled events; each channel keeps its own queue, drained by
+	 * poll_message. The protocol is pull-based, so an unsolicited message must not
+	 * go to the guest directly. */
+	GSList *handlers;
 } cr_impl;
+
+typedef struct {
+	char *name;
+	GQueue *bodies;  /* char*, JSON-encoded payloads, oldest first */
+} cr_handler;
 
 /* Defined below cr_navigate, which uses it to confirm a frame is obtainable. */
 static int cr_capture(cr_impl *self, char **error);
@@ -796,6 +807,68 @@ static dwb_backend *cr_create(int width, int height, char **error)
 
 /* Handles one decoded CDP message. Only screencast frames carry data this
  * backend needs; command replies are matched by the caller. */
+
+/* Queue a payload for a registered channel. Called from the DevTools event pump, so it
+ * must not touch the guest socket: the protocol is synchronous and an unsolicited message
+ * would be read as the answer to whatever request is in flight. */
+static void cr_queue_body(cr_impl *self, const char *name, const char *body)
+{
+	for (GSList *it = self->handlers; it; it = it->next) {
+		cr_handler *hc = it->data;
+		if (strcmp(hc->name, name) == 0) {
+			g_queue_push_tail(hc->bodies, g_strdup(body));
+			return;
+		}
+	}
+}
+
+static int cr_add_handler(dwb_backend *backend, const char *name, char **error)
+{
+	cr_impl *self = backend->impl;
+	for (GSList *it = self->handlers; it; it = it->next) {
+		cr_handler *hc = it->data;
+		if (strcmp(hc->name, name) == 0)
+			return 0;  /* Runtime.addBinding is per-context; installing twice is not an error */
+	}
+
+	/* The guest names the channel and Chromium only accepts a binding name, so the
+	 * two are the same string and the event carries it back to us. */
+	int id = self->next_id++;
+	char params[512];
+	snprintf(params, sizeof(params), "{\"name\":\"%s\"}", name);
+	if (cr_send_cmd_raw(self, id, "Runtime.addBinding", params) != 0) {
+		set_error(error, "Runtime.addBinding failed for channel '%s'", name);
+		return -1;
+	}
+
+	cr_handler *hc = g_new0(cr_handler, 1);
+	hc->name = g_strdup(name);
+	hc->bodies = g_queue_new();
+	self->handlers = g_slist_append(self->handlers, hc);
+	return 0;
+}
+
+static int cr_poll_message(dwb_backend *backend, const char *name, char **body,
+                           char **error)
+{
+	cr_impl *self = backend->impl;
+	/* Chromium delivers asynchronously, so drain the socket before answering: a
+	 * bindingCalled that arrived since the last poll would otherwise sit unseen until
+	 * the next request, and the guest would see an empty queue. */
+	ws_pump(self, cr_pump_handler, NULL);
+
+	for (GSList *it = self->handlers; it; it = it->next) {
+		cr_handler *hc = it->data;
+		if (strcmp(hc->name, name) != 0)
+			continue;
+		g_free(*body);
+		*body = g_queue_pop_head(hc->bodies);  /* NULL when the queue is empty */
+		return 0;
+	}
+	set_error(error, "no such message handler '%s'", name);
+	return -1;
+}
+
 static void cr_handle_message(cr_impl *self, const char *json)
 {
 	/* Screencast frames arrive as base64 in Page.screencastFrame. Extracting
@@ -803,6 +876,28 @@ static void cr_handle_message(cr_impl *self, const char *json)
 	 * the closing quote, which is safe because base64 has no escapes. */
 	if (strstr(json, "Page.loadEventFired"))
 		self->loaded = TRUE;
+
+	/* A page posted to a registered channel. Queued only: writing to the guest
+	 * socket here would desynchronise the synchronous protocol. */
+	if (strstr(json, "Runtime.bindingCalled")) {
+		const char *nm = strstr(json, "\"name\":\"");
+		if (nm) {
+			nm += 8;
+			const char *nend = strchr(nm, '"');
+			const char *pm = strstr(json, "\"payload\":\"");
+			if (nend && pm) {
+				pm += 11;
+				const char *pend = strchr(pm, '"');
+				if (pend) {
+					char *name = g_strndup(nm, nend - nm);
+					char *payload = g_strndup(pm, pend - pm);
+					cr_queue_body(self, name, payload);
+					g_free(name);
+					g_free(payload);
+				}
+			}
+		}
+	}
 
 	const char *marker = "\"data\":\"";
 	const char *at = strstr(json, marker);
@@ -1118,4 +1213,6 @@ const dwb_backend_ops dwb_backend_chromium = {
 	.evaluate = cr_evaluate,
 	.wait = cr_wait,
 	.add_script = cr_add_script,
+	.add_handler = cr_add_handler,
+	.poll_message = cr_poll_message,
 };
