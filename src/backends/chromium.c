@@ -1031,6 +1031,13 @@ static void cr_destroy(dwb_backend *backend)
 	g_free(self->frame);
 	g_free(self->chrome_ws_url);
 	g_free(self->pending);
+	for (GSList *it = self->handlers; it; it = it->next) {
+		cr_handler *hc = it->data;
+		g_queue_free_full(hc->bodies, g_free);
+		g_free(hc->name);
+		g_free(hc);
+	}
+	g_slist_free(self->handlers);
 	g_free(self);
 	free(backend);
 }

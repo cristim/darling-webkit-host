@@ -102,56 +102,64 @@ static int has_handler(cr_impl *self, const char *name)
 
 int main(void)
 {
-	cr_impl self;
-	memset(&self, 0, sizeof(self));
-	self.ws_fd = -1;
-	add_queue(&self, "ylevent");
+	cr_impl *selfp = g_new0(cr_impl, 1);
+	selfp->ws_fd = -1;
+	add_queue(selfp, "ylevent");
 
-	feed_binding(&self, "ylevent", "{\"ev\":\"video\",\"state\":\"playing\"}");
-	expect_body(&self, "body with quotes arrives intact", "ylevent",
+	feed_binding(selfp, "ylevent", "{\"ev\":\"video\",\"state\":\"playing\"}");
+	expect_body(selfp, "body with quotes arrives intact", "ylevent",
 	            "{\"ev\":\"video\",\"state\":\"playing\"}");
-	feed_binding(&self, "ylevent", "line1\nline2\ttabbed");
-	expect_body(&self, "newline and tab are decoded", "ylevent", "line1\nline2\ttabbed");
-	feed_binding(&self, "ylevent", "back\\slash");
-	expect_body(&self, "backslash is decoded", "ylevent", "back\\slash");
+	feed_binding(selfp, "ylevent", "line1\nline2\ttabbed");
+	expect_body(selfp, "newline and tab are decoded", "ylevent", "line1\nline2\ttabbed");
+	feed_binding(selfp, "ylevent", "back\\slash");
+	expect_body(selfp, "backslash is decoded", "ylevent", "back\\slash");
 
-	cr_handle_message(&self,
+	cr_handle_message(selfp,
 	    "{\"method\":\"Runtime.bindingCalled\",\"params\":{\"name\":\"ylevent\","
 	    "\"payload\":\"a\\/b \\u00e9 \\ud83d\\ude00 \\b\\f\\r\",\"executionContextId\":1}}");
-	expect_body(&self, "slash, BMP and surrogate-pair escapes are decoded", "ylevent",
+	expect_body(selfp, "slash, BMP and surrogate-pair escapes are decoded", "ylevent",
 	            "a/b \xc3\xa9 \xf0\x9f\x98\x80 \b\f\r");
 
 	char *err = NULL;
-	int rc = add_with_reply(&self, "dw\"bProbe", "{\"id\":100,\"result\":{}}", &err);
-	check("quoted channel name is rejected", rc != 0 && !has_handler(&self, "dw\"bProbe"),
-	      has_handler(&self, "dw\"bProbe") ? "registered" : "returned success");
+	int rc = add_with_reply(selfp, "dw\"bProbe", "{\"id\":100,\"result\":{}}", &err);
+	check("quoted channel name is rejected", rc != 0 && !has_handler(selfp, "dw\"bProbe"),
+	      has_handler(selfp, "dw\"bProbe") ? "registered" : "returned success");
 	check("rejection carries a reason", err && *err, err ? err : "(no error)");
 	g_free(err);
 	err = NULL;
-	rc = add_with_reply(&self, "x\",\"k\":\"v", "{\"id\":100,\"result\":{}}", &err);
+	rc = add_with_reply(selfp, "x\",\"k\":\"v", "{\"id\":100,\"result\":{}}", &err);
 	check("param-injecting channel name is rejected", rc != 0, "returned success");
 	g_free(err);
 	err = NULL;
 
-	rc = add_with_reply(&self, "okName", "{\"id\":100,\"result\":{}}", &err);
-	check("successful addBinding registers the channel", rc == 0 && has_handler(&self, "okName"),
+	rc = add_with_reply(selfp, "okName", "{\"id\":100,\"result\":{}}", &err);
+	check("successful addBinding registers the channel", rc == 0 && has_handler(selfp, "okName"),
 	      err ? err : "not registered");
 	g_free(err);
 	err = NULL;
 
-	rc = add_with_reply(&self, "refused",
+	rc = add_with_reply(selfp, "refused",
 	    "{\"id\":100,\"error\":{\"code\":-32602,\"message\":\"Invalid parameters\"}}", &err);
-	check("failed addBinding reply returns failure", rc != 0 && !has_handler(&self, "refused"),
+	check("failed addBinding reply returns failure", rc != 0 && !has_handler(selfp, "refused"),
 	      rc == 0 ? "returned success" : "registered anyway");
 	check("failure names the CDP message", err && strstr(err, "Invalid parameters"),
 	      err ? err : "(no error)");
 	g_free(err);
 	err = NULL;
 
-	rc = add_with_reply(&self, "silent", NULL, &err);
-	check("missing addBinding reply returns failure", rc != 0 && !has_handler(&self, "silent"),
+	rc = add_with_reply(selfp, "silent", NULL, &err);
+	check("missing addBinding reply returns failure", rc != 0 && !has_handler(selfp, "silent"),
 	      rc == 0 ? "returned success" : "registered anyway");
 	g_free(err);
+
+	/* cr_destroy must release every handler's name and queued bodies. A leak is
+	 * invisible without a sanitizer, so run this binary under
+	 * -fsanitize=address: LeakSanitizer then fails the process. */
+	feed_binding(selfp, "ylevent", "left in the queue");
+	dwb_backend *db = calloc(1, sizeof(*db));
+	db->impl = selfp;
+	cr_destroy(db);
+	check("cr_destroy with queued handlers completes", 1, NULL);
 
 	return failures ? 1 : 0;
 }
