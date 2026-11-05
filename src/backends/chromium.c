@@ -869,6 +869,66 @@ static int cr_poll_message(dwb_backend *backend, const char *name, char **body,
 	return -1;
 }
 
+/* Decodes the JSON string whose first character after the opening quote is at `p`,
+ * stopping at the closing quote. Returns the raw UTF-8 text the page posted, or NULL
+ * when the string is malformed or unterminated. Chromium escapes the payload on the
+ * wire, so stopping at the first quote or leaving the escapes in place corrupts every
+ * JSON body a page sends. */
+static char *cr_json_string(const char *p)
+{
+	GString *out = g_string_new(NULL);
+	for (; *p && *p != '"'; p++) {
+		if (*p != '\\') {
+			g_string_append_c(out, *p);
+			continue;
+		}
+		switch (*++p) {
+		case '"': case '\\': case '/': g_string_append_c(out, *p); break;
+		case 'b': g_string_append_c(out, '\b'); break;
+		case 'f': g_string_append_c(out, '\f'); break;
+		case 'n': g_string_append_c(out, '\n'); break;
+		case 'r': g_string_append_c(out, '\r'); break;
+		case 't': g_string_append_c(out, '\t'); break;
+		case 'u': {
+			unsigned cp = 0;
+			for (int i = 1; i <= 4; i++) {
+				if (!g_ascii_isxdigit(p[i]))
+					goto bad;
+				cp = cp * 16 + (unsigned)g_ascii_xdigit_value(p[i]);
+			}
+			p += 4;
+			if (cp >= 0xD800 && cp <= 0xDBFF && p[1] == '\\' && p[2] == 'u') {
+				unsigned lo = 0;
+				int ok = 1;
+				for (int i = 3; i <= 6; i++) {
+					if (!g_ascii_isxdigit(p[i])) {
+						ok = 0;
+						break;
+					}
+					lo = lo * 16 + (unsigned)g_ascii_xdigit_value(p[i]);
+				}
+				if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+					cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+					p += 6;
+				}
+			}
+			if (cp >= 0xD800 && cp <= 0xDFFF)
+				cp = 0xFFFD;  /* lone surrogate has no UTF-8 form */
+			g_string_append_unichar(out, (gunichar)cp);
+			break;
+		}
+		default:
+			goto bad;
+		}
+	}
+	if (*p != '"')
+		goto bad;
+	return g_string_free(out, FALSE);
+bad:
+	g_string_free(out, TRUE);
+	return NULL;
+}
+
 static void cr_handle_message(cr_impl *self, const char *json)
 {
 	/* Screencast frames arrive as base64 in Page.screencastFrame. Extracting
@@ -881,21 +941,14 @@ static void cr_handle_message(cr_impl *self, const char *json)
 	 * socket here would desynchronise the synchronous protocol. */
 	if (strstr(json, "Runtime.bindingCalled")) {
 		const char *nm = strstr(json, "\"name\":\"");
-		if (nm) {
-			nm += 8;
-			const char *nend = strchr(nm, '"');
-			const char *pm = strstr(json, "\"payload\":\"");
-			if (nend && pm) {
-				pm += 11;
-				const char *pend = strchr(pm, '"');
-				if (pend) {
-					char *name = g_strndup(nm, nend - nm);
-					char *payload = g_strndup(pm, pend - pm);
-					cr_queue_body(self, name, payload);
-					g_free(name);
-					g_free(payload);
-				}
-			}
+		const char *pm = strstr(json, "\"payload\":\"");
+		if (nm && pm) {
+			char *name = cr_json_string(nm + 8);
+			char *payload = cr_json_string(pm + 11);
+			if (name && payload)
+				cr_queue_body(self, name, payload);
+			g_free(name);
+			g_free(payload);
 		}
 	}
 
