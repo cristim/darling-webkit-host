@@ -822,6 +822,20 @@ static void cr_queue_body(cr_impl *self, const char *name, const char *body)
 	}
 }
 
+/* The name is spliced into the CDP params and echoed back in bindingCalled, and
+ * Chromium exposes it as window[name]. Restricting it to plain identifier
+ * characters means neither side needs escaping and a hostile name cannot inject
+ * params. Rejected loudly rather than mangled. */
+static int cr_name_is_safe(const char *name)
+{
+	if (!*name)
+		return 0;
+	for (const char *p = name; *p; p++)
+		if (!g_ascii_isalnum(*p) && !strchr("_$.-", *p))
+			return 0;
+	return 1;
+}
+
 static int cr_add_handler(dwb_backend *backend, const char *name, char **error)
 {
 	cr_impl *self = backend->impl;
@@ -833,6 +847,11 @@ static int cr_add_handler(dwb_backend *backend, const char *name, char **error)
 
 	/* The guest names the channel and Chromium only accepts a binding name, so the
 	 * two are the same string and the event carries it back to us. */
+	if (!cr_name_is_safe(name)) {
+		set_error(error, "channel name '%s' is not usable on the chromium backend "
+		          "(allowed: letters, digits, _ $ . -)", name);
+		return -1;
+	}
 	int id = self->next_id++;
 	char params[512];
 	snprintf(params, sizeof(params), "{\"name\":\"%s\"}", name);
@@ -840,6 +859,20 @@ static int cr_add_handler(dwb_backend *backend, const char *name, char **error)
 		set_error(error, "Runtime.addBinding failed for channel '%s'", name);
 		return -1;
 	}
+	char *reply = cr_wait_reply(self, id, 5000);
+	if (!reply) {
+		set_error(error, "no reply to Runtime.addBinding for channel '%s'", name);
+		return -1;
+	}
+	if (strstr(reply, "\"error\"")) {
+		char *msg = json_string_value(strstr(reply, "\"error\""), "\"message\"");
+		set_error(error, "Runtime.addBinding refused channel '%s': %s", name,
+		          msg ? msg : "unknown error");
+		g_free(msg);
+		free(reply);
+		return -1;
+	}
+	free(reply);
 
 	cr_handler *hc = g_new0(cr_handler, 1);
 	hc->name = g_strdup(name);
