@@ -1039,10 +1039,8 @@ static int cr_navigate(dwb_backend *backend, const char *url, char **error,
                       dwb_response *out)
 {
 	/* A response is not captured on this backend. It is left empty rather than
-	 * refused: the guest treats an absent response as unknown, and this backend
-	 * refuses message handlers outright, so a delegate that needs the response
-	 * has nothing to do here anyway. Filling it in with a guess would be worse
-	 * than reporting nothing. */
+	 * refused: the guest treats an absent response as unknown. Filling it in
+	 * with a guess would be worse than reporting nothing. */
 	if (out) {
 		out->url = NULL;
 		out->mime = NULL;

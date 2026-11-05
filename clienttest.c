@@ -38,10 +38,14 @@ int main(int argc, char **argv)
 
 	char *backend = NULL;
 	int w = 0, h = 0;
-	int supports_handlers = 1;
+	/* Every backend accepts add_handler. Only webkitgtk also exposes
+	 * window.webkit.messageHandlers to the page; chromium delivers through a
+	 * Runtime.addBinding function instead, with no webkit.* shim yet, so the
+	 * checks that post from the page are scoped to webkitgtk. */
+	int page_shim = 1;
 	int ok = dwb_client_hello(&c, &backend, &w, &h) == 0;
 	if (ok && backend && strcmp(backend, "webkitgtk") != 0)
-		supports_handlers = 0;
+		page_shim = 0;
 	check("hello: succeeds", ok, "");
 	check("hello: names a backend", ok && backend && *backend, backend ? backend : "");
 	check("hello: reports geometry", ok && w > 0 && h > 0, NULL);
@@ -123,13 +127,8 @@ int main(int argc, char **argv)
 	 * queue by polling. Checked as a real round trip, not by trusting the
 	 * registration acknowledgement. */
 	ok = dwb_client_add_handler(&c, "dwbTest") == 0;
-	if (!supports_handlers) {
-		/* Refusing cleanly is the correct behaviour for a backend that does not
-		 * implement handlers, and is asserted rather than skipped. */
-		check("handler: unsupported backend refuses cleanly", !ok, c.error);
-		check("handler: refusal carries a reason", !ok && c.error[0] != '\0', c.error);
-	} else {
 	check("handler: registered", ok, c.error);
+	if (page_shim) {
 	ok = dwb_client_eval(&c,
 	        "(function(){try{webkit.messageHandlers.dwbTest.postMessage('ping-from-page');"
 	        "return 'posted';}catch(e){return 'ERR:'+e.message;}})()", &val) == 0;
@@ -162,11 +161,10 @@ int main(int argc, char **argv)
 	 * the script at the first escaped quote and reported it as a page syntax
 	 * error - stayed invisible. This is the test that has a JSON body in it.
 	 *
-	 * Scoped to backends with handler support, because these five checks all
-	 * depend on registering one. Chromium refuses handlers by design, and its
-	 * refusal is covered by the capability-scope tests above; failing these
-	 * there would only assert that a deliberate refusal happens. */
-	if (supports_handlers) {
+	 * Scoped to backends with the page-side webkit shim, because these five
+	 * checks post through window.webkit.messageHandlers. Chromium registers
+	 * handlers but has no such shim, so there is nothing for these to post with. */
+	if (page_shim) {
 		int rc = dwb_client_add_handler(&c, "ylevent");
 		check("app channel: ylevent registers", rc == 0, c.error);
 		rc = dwb_client_navigate(&c, "https://example.com");
@@ -231,7 +229,7 @@ int main(int argc, char **argv)
 	 * script was. The channel name is the interesting one - it is echoed in
 	 * every reply, so a truncated registration would have made the guest poll a
 	 * name the host never registered. */
-	if (supports_handlers) {
+	if (page_shim) {
 		const char *quoteName = "dw\"bProbe";
 		int rc = dwb_client_add_handler(&c, quoteName);
 		check("envelope: a channel name with a quote registers", rc == 0, c.error);
@@ -258,6 +256,12 @@ int main(int argc, char **argv)
 		      got == 1 && body && strcmp(body, "a\"b\nc") == 0,
 		      body ? body : "queue empty");
 		free(body);
+	} else {
+		/* Chromium takes only plain identifier names; a quote must be refused
+		 * with a reason rather than corrupt the registration. */
+		int rc = dwb_client_add_handler(&c, "dw\"bProbe");
+		check("envelope: chromium refuses a channel name with a quote",
+		      rc != 0 && c.error[0] != '\0', c.error);
 	}
 
 	/* A URL carrying a quote in its query string reaches the host's url field
@@ -316,7 +320,7 @@ int main(int argc, char **argv)
 	 *
 	 * Which selectors are confirmed in the binary and which are only part of the
 	 * API this guest stands in for is recorded in KNOWN-ISSUES.md. */
-	if (supports_handlers) {
+	if (page_shim) {
 		ok = dwb_client_add_script(&c,
 		        "window.__yle = 'start'; var __t = document.title;", 1, 1) == 0;
 		check("app sequence: document-start script accepted", ok, c.error);
