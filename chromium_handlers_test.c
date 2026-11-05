@@ -56,6 +56,34 @@ static cr_handler *add_queue(cr_impl *self, const char *name)
 	return hc;
 }
 
+/* Runs cr_handle_message with stderr captured; returns the text it printed. */
+static char *capture_stderr(cr_impl *self, const char *msg)
+{
+	fflush(stderr);
+	int saved = dup(2);
+	FILE *tmp = tmpfile();
+	dup2(fileno(tmp), 2);
+	cr_handle_message(self, msg);
+	fflush(stderr);
+	dup2(saved, 2);
+	close(saved);
+	long n = ftell(tmp);
+	char *out = g_malloc0((gsize)n + 1);
+	rewind(tmp);
+	if (fread(out, 1, (size_t)n, tmp) != (size_t)n)
+		abort();
+	fclose(tmp);
+	return out;
+}
+
+static guint queued_total(cr_impl *self)
+{
+	guint n = 0;
+	for (GSList *it = self->handlers; it; it = it->next)
+		n += g_queue_get_length(((cr_handler *)it->data)->bodies);
+	return n;
+}
+
 /* Writes one unmasked server-to-client text frame, as Chromium sends them. */
 static void server_send(int fd, const char *msg)
 {
@@ -131,6 +159,33 @@ int main(void)
 	    "\"payload\":\"a\\u0000b\",\"executionContextId\":1}}");
 	expect_body(selfp, "NUL escape becomes U+FFFD, not a truncation", "ylevent",
 	            "a\xef\xbf\xbd" "b");
+
+	/* Events that merely mention the method text must not reach the handler path. */
+	char *log = capture_stderr(selfp,
+	    "{\"method\":\"Runtime.consoleAPICalled\",\"params\":{\"type\":\"log\","
+	    "\"args\":[{\"type\":\"string\",\"value\":\"Runtime.bindingCalled\"}]}}");
+	check("consoleAPICalled mentioning the method is silent", !*log && queued_total(selfp) == 0, log);
+	g_free(log);
+	log = capture_stderr(selfp,
+	    "{\"id\":7,\"result\":{\"result\":{\"type\":\"string\","
+	    "\"value\":\"Runtime.bindingCalled\"}}}");
+	check("evaluate reply mentioning the method is silent", !*log && queued_total(selfp) == 0, log);
+	g_free(log);
+
+	/* A genuine malformed event logs, but only the first few. */
+	const char *bad = "{\"method\":\"Runtime.bindingCalled\",\"params\":{\"name\":\"ylevent\","
+	                  "\"executionContextId\":1}}";
+	log = capture_stderr(selfp, bad);
+	check("malformed bindingCalled is logged", strstr(log, "dropped a bindingCalled") != NULL, log);
+	g_free(log);
+	for (int i = 0; i < 3; i++)
+		g_free(capture_stderr(selfp, bad));
+	log = capture_stderr(selfp, bad);
+	check("5th drop says further drops are suppressed", strstr(log, "suppressed") != NULL, log);
+	g_free(log);
+	log = capture_stderr(selfp, bad);
+	check("6th identical drop is not logged", !*log, log);
+	g_free(log);
 
 	char *err = NULL;
 	int rc = add_with_reply(selfp, "dw\"bProbe", "{\"id\":100,\"result\":{}}", &err);

@@ -54,6 +54,7 @@ typedef struct {
 	int io_next_id;   /* id awaiting an IO.read reply */
 	int eval_next_id; /* id awaiting a Runtime.evaluate reply */
 	gboolean loaded;  /* set when Page.loadEventFired arrives */
+	int dropped_events; /* unparseable bindingCalled events seen, bounds the log */
 	/* Script-message channels the guest registered. Chromium has no addHandler, so
 	 * the binding is installed with Runtime.addBinding and messages arrive as
 	 * Runtime.bindingCalled events; each channel keeps its own queue, drained by
@@ -925,17 +926,20 @@ static void cr_handle_message(cr_impl *self, const char *json)
 
 	/* A page posted to a registered channel. Queued only: writing to the guest
 	 * socket here would desynchronise the synchronous protocol. */
-	if (strstr(json, "Runtime.bindingCalled")) {
+	char *method = json_string_value(json, "\"method\"");
+	if (method && strcmp(method, "Runtime.bindingCalled") == 0) {
 		char *name = json_string_value(json, "\"name\"");
 		char *payload = json_string_value(json, "\"payload\"");
 		if (name && payload)
 			cr_queue_body(self, name, payload);
-		else
-			g_printerr("chromium: dropped a bindingCalled event with an unparseable %s\n",
-			           name ? "payload" : "name");
+		else if (++self->dropped_events <= 5)
+			g_printerr("chromium: dropped a bindingCalled event with an unparseable %s%s\n",
+			           name ? "payload" : "name",
+			           self->dropped_events == 5 ? " (further drops suppressed)" : "");
 		g_free(name);
 		g_free(payload);
 	}
+	g_free(method);
 
 	const char *marker = "\"data\":\"";
 	const char *at = strstr(json, marker);
