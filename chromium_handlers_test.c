@@ -120,6 +120,12 @@ int main(void)
 	expect_body(selfp, "slash, BMP and surrogate-pair escapes are decoded", "ylevent",
 	            "a/b \xc3\xa9 \xf0\x9f\x98\x80 \b\f\r");
 
+	cr_handle_message(selfp,
+	    "{\"method\":\"Runtime.bindingCalled\",\"params\":{\"name\":\"ylevent\","
+	    "\"payload\":\"x\\ud83dy \\ude00z\",\"executionContextId\":1}}");
+	expect_body(selfp, "lone surrogates become U+FFFD", "ylevent",
+	            "x\xef\xbf\xbdy \xef\xbf\xbdz");
+
 	char *err = NULL;
 	int rc = add_with_reply(selfp, "dw\"bProbe", "{\"id\":100,\"result\":{}}", &err);
 	check("quoted channel name is rejected", rc != 0 && !has_handler(selfp, "dw\"bProbe"),
