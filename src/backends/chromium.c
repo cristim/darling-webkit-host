@@ -562,11 +562,13 @@ static char *json_string_value(const char *from, const char *key)
 				ok = g_ascii_isxdigit(raw_out[i + d]);
 				cp = cp * 16 + (unsigned)g_ascii_xdigit_value(raw_out[i + d]);
 			}
-			if (!ok || cp == 0) {  /* malformed, or NUL which a C string cannot hold */
+			if (!ok) {
 				out[w++] = raw_out[i];
 				break;
 			}
 			i += 4;
+			if (cp == 0)
+				cp = 0xFFFD;  /* a C string cannot hold NUL; truncating would hide data */
 			/* A high surrogate pairs with the following \uDC00-\uDFFF escape. */
 			if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < raw &&
 			    raw_out[i + 1] == '\\' && raw_out[i + 2] == 'u') {
@@ -928,6 +930,9 @@ static void cr_handle_message(cr_impl *self, const char *json)
 		char *payload = json_string_value(json, "\"payload\"");
 		if (name && payload)
 			cr_queue_body(self, name, payload);
+		else
+			g_printerr("chromium: dropped a bindingCalled event with an unparseable %s\n",
+			           name ? "payload" : "name");
 		g_free(name);
 		g_free(payload);
 	}

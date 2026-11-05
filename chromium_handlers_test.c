@@ -126,6 +126,12 @@ int main(void)
 	expect_body(selfp, "lone surrogates become U+FFFD", "ylevent",
 	            "x\xef\xbf\xbdy \xef\xbf\xbdz");
 
+	cr_handle_message(selfp,
+	    "{\"method\":\"Runtime.bindingCalled\",\"params\":{\"name\":\"ylevent\","
+	    "\"payload\":\"a\\u0000b\",\"executionContextId\":1}}");
+	expect_body(selfp, "NUL escape becomes U+FFFD, not a truncation", "ylevent",
+	            "a\xef\xbf\xbd" "b");
+
 	char *err = NULL;
 	int rc = add_with_reply(selfp, "dw\"bProbe", "{\"id\":100,\"result\":{}}", &err);
 	check("quoted channel name is rejected", rc != 0 && !has_handler(selfp, "dw\"bProbe"),
