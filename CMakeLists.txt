@@ -57,3 +57,14 @@ target_link_libraries(clienttest PRIVATE dwb_client)
 
 add_executable(shmtest shmtest.c)
 target_link_libraries(shmtest PRIVATE dwb_client)
+
+# Host-side test for the chromium backend's message handlers: includes the
+# backend source and feeds it CDP events over a socketpair, no browser needed.
+# Linux-only like the backend it includes; run with `ctest`.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	enable_testing()
+	add_executable(chromium_handlers_test chromium_handlers_test.c)
+	target_include_directories(chromium_handlers_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+	target_link_libraries(chromium_handlers_test PRIVATE PkgConfig::GTK3)
+	add_test(NAME chromium_handlers COMMAND chromium_handlers_test)
+endif()

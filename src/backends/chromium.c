@@ -54,7 +54,19 @@ typedef struct {
 	int io_next_id;   /* id awaiting an IO.read reply */
 	int eval_next_id; /* id awaiting a Runtime.evaluate reply */
 	gboolean loaded;  /* set when Page.loadEventFired arrives */
+	int dropped_events; /* unparseable bindingCalled events seen, bounds the log */
+	/* Script-message channels the guest registered. Chromium has no addHandler, so
+	 * the binding is installed with Runtime.addBinding and messages arrive as
+	 * Runtime.bindingCalled events; each channel keeps its own queue, drained by
+	 * poll_message. The protocol is pull-based, so an unsolicited message must not
+	 * go to the guest directly. */
+	GSList *handlers;
 } cr_impl;
+
+typedef struct {
+	char *name;
+	GQueue *bodies;  /* char*, JSON-encoded payloads, oldest first */
+} cr_handler;
 
 /* Defined below cr_navigate, which uses it to confirm a frame is obtainable. */
 static int cr_capture(cr_impl *self, char **error);
@@ -545,23 +557,36 @@ static char *json_string_value(const char *from, const char *key)
 		case 'b': out[w++] = '\b'; break;
 		case 'f': out[w++] = '\f'; break;
 		case 'u': {
-			if (i + 4 >= raw) { out[w++] = raw_out[i]; break; }
-			char hex[5] = { raw_out[i+1], raw_out[i+2], raw_out[i+3], raw_out[i+4], 0 };
-			char *endp = NULL;
-			long v = strtol(hex, &endp, 16);
-			if (endp && *endp == 0 && v > 0 && v < 0x80) {
-				out[w++] = (char)v; i += 4; break;
+			unsigned cp = 0;
+			int ok = i + 4 < raw;
+			for (int d = 1; ok && d <= 4; d++) {
+				ok = g_ascii_isxdigit(raw_out[i + d]);
+				cp = cp * 16 + (unsigned)g_ascii_xdigit_value(raw_out[i + d]);
 			}
-			if (endp && *endp == 0 && v >= 0x80 && v < 0x800) {
-				out[w++] = (char)(0xC0 | (v >> 6));
-				out[w++] = (char)(0x80 | (v & 0x3F)); i += 4; break;
+			if (!ok) {
+				out[w++] = raw_out[i];
+				break;
 			}
-			if (endp && *endp == 0 && v >= 0x800 && v < 0x10000) {
-				out[w++] = (char)(0xE0 | (v >> 12));
-				out[w++] = (char)(0x80 | ((v >> 6) & 0x3F));
-				out[w++] = (char)(0x80 | (v & 0x3F)); i += 4; break;
+			i += 4;
+			if (cp == 0)
+				cp = 0xFFFD;  /* a C string cannot hold NUL; truncating would hide data */
+			/* A high surrogate pairs with the following \uDC00-\uDFFF escape. */
+			if (cp >= 0xD800 && cp <= 0xDBFF && i + 6 < raw &&
+			    raw_out[i + 1] == '\\' && raw_out[i + 2] == 'u') {
+				unsigned lo = 0;
+				int lok = 1;
+				for (int d = 3; lok && d <= 6; d++) {
+					lok = g_ascii_isxdigit(raw_out[i + d]);
+					lo = lo * 16 + (unsigned)g_ascii_xdigit_value(raw_out[i + d]);
+				}
+				if (lok && lo >= 0xDC00 && lo <= 0xDFFF) {
+					cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+					i += 6;
+				}
 			}
-			out[w++] = raw_out[i];
+			if (cp >= 0xD800 && cp <= 0xDFFF)
+				cp = 0xFFFD;  /* a lone surrogate has no UTF-8 form */
+			w += (size_t)g_unichar_to_utf8((gunichar)cp, out + w);
 			break;
 		}
 		default: out[w++] = raw_out[i]; break;
@@ -796,6 +821,101 @@ static dwb_backend *cr_create(int width, int height, char **error)
 
 /* Handles one decoded CDP message. Only screencast frames carry data this
  * backend needs; command replies are matched by the caller. */
+
+/* Queue a payload for a registered channel. Called from the DevTools event pump, so it
+ * must not touch the guest socket: the protocol is synchronous and an unsolicited message
+ * would be read as the answer to whatever request is in flight. */
+static void cr_queue_body(cr_impl *self, const char *name, const char *body)
+{
+	for (GSList *it = self->handlers; it; it = it->next) {
+		cr_handler *hc = it->data;
+		if (strcmp(hc->name, name) == 0) {
+			g_queue_push_tail(hc->bodies, g_strdup(body));
+			return;
+		}
+	}
+}
+
+/* The name is spliced into the CDP params and echoed back in bindingCalled, and
+ * Chromium exposes it as window[name]. Restricting it to plain identifier
+ * characters means neither side needs escaping and a hostile name cannot inject
+ * params. Rejected loudly rather than mangled. */
+static int cr_name_is_safe(const char *name)
+{
+	if (!*name)
+		return 0;
+	for (const char *p = name; *p; p++)
+		if (!g_ascii_isalnum(*p) && !strchr("_$.-", *p))
+			return 0;
+	return 1;
+}
+
+static int cr_add_handler(dwb_backend *backend, const char *name, char **error)
+{
+	cr_impl *self = backend->impl;
+	for (GSList *it = self->handlers; it; it = it->next) {
+		cr_handler *hc = it->data;
+		if (strcmp(hc->name, name) == 0)
+			return 0;  /* Runtime.addBinding is per-context; installing twice is not an error */
+	}
+
+	/* The guest names the channel and Chromium only accepts a binding name, so the
+	 * two are the same string and the event carries it back to us. */
+	if (!cr_name_is_safe(name)) {
+		set_error(error, "channel name '%s' is not usable on the chromium backend "
+		          "(allowed: letters, digits, _ $ . -)", name);
+		return -1;
+	}
+	int id = self->next_id++;
+	char params[512];
+	snprintf(params, sizeof(params), "{\"name\":\"%s\"}", name);
+	if (cr_send_cmd_raw(self, id, "Runtime.addBinding", params) != 0) {
+		set_error(error, "Runtime.addBinding failed for channel '%s'", name);
+		return -1;
+	}
+	char *reply = cr_wait_reply(self, id, 5000);
+	if (!reply) {
+		set_error(error, "no reply to Runtime.addBinding for channel '%s'", name);
+		return -1;
+	}
+	if (strstr(reply, "\"error\"")) {
+		char *msg = json_string_value(strstr(reply, "\"error\""), "\"message\"");
+		set_error(error, "Runtime.addBinding refused channel '%s': %s", name,
+		          msg ? msg : "unknown error");
+		g_free(msg);
+		free(reply);
+		return -1;
+	}
+	free(reply);
+
+	cr_handler *hc = g_new0(cr_handler, 1);
+	hc->name = g_strdup(name);
+	hc->bodies = g_queue_new();
+	self->handlers = g_slist_append(self->handlers, hc);
+	return 0;
+}
+
+static int cr_poll_message(dwb_backend *backend, const char *name, char **body,
+                           char **error)
+{
+	cr_impl *self = backend->impl;
+	/* Chromium delivers asynchronously, so drain the socket before answering: a
+	 * bindingCalled that arrived since the last poll would otherwise sit unseen until
+	 * the next request, and the guest would see an empty queue. */
+	ws_pump(self, cr_pump_handler, NULL);
+
+	for (GSList *it = self->handlers; it; it = it->next) {
+		cr_handler *hc = it->data;
+		if (strcmp(hc->name, name) != 0)
+			continue;
+		g_free(*body);
+		*body = g_queue_pop_head(hc->bodies);  /* NULL when the queue is empty */
+		return 0;
+	}
+	set_error(error, "no such message handler '%s'", name);
+	return -1;
+}
+
 static void cr_handle_message(cr_impl *self, const char *json)
 {
 	/* Screencast frames arrive as base64 in Page.screencastFrame. Extracting
@@ -803,6 +923,23 @@ static void cr_handle_message(cr_impl *self, const char *json)
 	 * the closing quote, which is safe because base64 has no escapes. */
 	if (strstr(json, "Page.loadEventFired"))
 		self->loaded = TRUE;
+
+	/* A page posted to a registered channel. Queued only: writing to the guest
+	 * socket here would desynchronise the synchronous protocol. */
+	char *method = json_string_value(json, "\"method\"");
+	if (method && strcmp(method, "Runtime.bindingCalled") == 0) {
+		char *name = json_string_value(json, "\"name\"");
+		char *payload = json_string_value(json, "\"payload\"");
+		if (name && payload)
+			cr_queue_body(self, name, payload);
+		else if (++self->dropped_events <= 5)
+			g_printerr("chromium: dropped a bindingCalled event with an unparseable %s%s\n",
+			           name ? "payload" : "name",
+			           self->dropped_events == 5 ? " (further drops suppressed)" : "");
+		g_free(name);
+		g_free(payload);
+	}
+	g_free(method);
 
 	const char *marker = "\"data\":\"";
 	const char *at = strstr(json, marker);
@@ -850,6 +987,13 @@ static void cr_destroy(dwb_backend *backend)
 	g_free(self->frame);
 	g_free(self->chrome_ws_url);
 	g_free(self->pending);
+	for (GSList *it = self->handlers; it; it = it->next) {
+		cr_handler *hc = it->data;
+		g_queue_free_full(hc->bodies, g_free);
+		g_free(hc->name);
+		g_free(hc);
+	}
+	g_slist_free(self->handlers);
 	g_free(self);
 	free(backend);
 }
@@ -858,10 +1002,8 @@ static int cr_navigate(dwb_backend *backend, const char *url, char **error,
                       dwb_response *out)
 {
 	/* A response is not captured on this backend. It is left empty rather than
-	 * refused: the guest treats an absent response as unknown, and this backend
-	 * refuses message handlers outright, so a delegate that needs the response
-	 * has nothing to do here anyway. Filling it in with a guess would be worse
-	 * than reporting nothing. */
+	 * refused: the guest treats an absent response as unknown. Filling it in
+	 * with a guess would be worse than reporting nothing. */
 	if (out) {
 		out->url = NULL;
 		out->mime = NULL;
@@ -1118,4 +1260,6 @@ const dwb_backend_ops dwb_backend_chromium = {
 	.evaluate = cr_evaluate,
 	.wait = cr_wait,
 	.add_script = cr_add_script,
+	.add_handler = cr_add_handler,
+	.poll_message = cr_poll_message,
 };
