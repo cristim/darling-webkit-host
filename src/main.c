@@ -75,9 +75,11 @@ static int cmd_render(const char *url, const char *out_path, const char *backend
 	printf("navigated=%s\n", url);
 
 	/* Settle time before probing, so slow-starting players (YouTube especially)
-	 * have a chance to reach a playing state before anything is measured. */
+	 * have a chance to reach a playing state before anything is measured. Goes
+	 * through the backend rather than g_usleep: for a main-loop-bound engine a
+	 * sleep hands the page no time at all. */
 	if (eval_wait_ms > 0) {
-		g_usleep((guint64)eval_wait_ms * 1000);
+		ops->wait(backend, eval_wait_ms);
 		printf("settled_ms=%d\n", eval_wait_ms);
 	}
 
@@ -113,7 +115,7 @@ static int cmd_render(const char *url, const char *out_path, const char *backend
 	if (watch_ms > 0) {
 		int elapsed = 0;
 		while (elapsed < watch_ms) {
-			g_usleep(250000);
+			ops->wait(backend, 250);
 			elapsed += 250;
 			if (ops->render(backend, &frame, &error) != 0)
 				break;

@@ -774,6 +774,14 @@ static int cr_evaluate(dwb_backend *backend, const char *js, char **value, char 
 	return 0;
 }
 
+static void cr_wait(dwb_backend *backend, int ms)
+{
+	/* The page lives in the browser process, which has its own loop, so here
+	 * waiting really is just waiting. */
+	(void)backend;
+	g_usleep((guint64)ms * 1000);
+}
+
 const dwb_backend_ops dwb_backend_chromium = {
 	.name = "chromium",
 	.description = "Chromium via DevTools Protocol (media-compatibility fallback)",
@@ -784,4 +792,5 @@ const dwb_backend_ops dwb_backend_chromium = {
 	.resize = cr_resize,
 	.render = cr_render,
 	.evaluate = cr_evaluate,
+	.wait = cr_wait,
 };

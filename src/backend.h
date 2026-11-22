@@ -47,6 +47,13 @@ typedef struct {
 	 * caller frees. On failure *error is set. Either may be NULL if the caller
 	 * does not want it. */
 	int (*evaluate)(dwb_backend *backend, const char *js, char **value, char **error);
+
+	/* Gives the page `ms` of wall time. A backend whose engine is main-loop
+	 * bound has to iterate that loop here rather than sleep: WebKitGTK cannot
+	 * open a GStreamer pipeline, answer IPC or run a script while its loop is
+	 * not turning, so a plain sleep hands the page no time at all. A backend
+	 * whose page lives in another process can just sleep. */
+	void (*wait)(dwb_backend *backend, int ms);
 } dwb_backend_ops;
 
 struct dwb_backend {

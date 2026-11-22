@@ -72,23 +72,43 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
 		self->load_finished = TRUE;
 }
 
-/* Forces GDK scale 1 before GDK initialises. The host display is HiDPI, so a
- * 640x480 logical view became a 1280x960 device-pixel surface - correct
- * behaviour for GTK, but double the frame bytes a guest has to receive for no
- * benefit. Set here because GDK_SCALE is only read during initialisation. */
-static void pin_gdk_scale(void)
+/* Pins the two GDK settings that are only read during initialisation. */
+static void pin_gdk_env(void)
 {
 	static gsize once = 0;
-	if (g_once_init_enter(&once)) {
-		g_setenv("GDK_SCALE", "1", TRUE);
-		g_setenv("GDK_DPI_SCALE", "1", TRUE);
-		g_once_init_leave(&once, 1);
-	}
+	if (!g_once_init_enter(&once))
+		return;
+
+	/* The host display is HiDPI, so a 640x480 logical view became a 1280x960
+	 * device-pixel surface - correct behaviour for GTK, but double the frame
+	 * bytes a guest has to receive for no benefit. */
+	g_setenv("GDK_SCALE", "1", TRUE);
+	g_setenv("GDK_DPI_SCALE", "1", TRUE);
+
+	/* A desktop session exports GDK_BACKEND=wayland,x11,* to mean "whatever you
+	 * prefer", and GTK then picks Wayland and puts this service's window on the
+	 * logged-in user's desktop, ignoring the DISPLAY it was handed. Measured with
+	 * DISPLAY=:77 and the session's value: the toplevel's GdkWindow was not an
+	 * X11 window at all (GDK_IS_X11_WINDOW false, so gdk_x11_window_get_xid
+	 * asserted), render() returned twice the requested size, and every sampled
+	 * frame was byte-identical during playback. With GDK_BACKEND=x11 the same
+	 * code returns exactly 640x480 and 29 distinct frames over 8s of playback.
+	 *
+	 * A preference list or a wildcard is a session's choice, not an instruction
+	 * to this service, so it is replaced. A caller who deliberately wants one
+	 * backend keeps it. */
+	const char *backend = g_getenv("GDK_BACKEND");
+	gboolean explicit_backend = backend && *backend && !strchr(backend, ',') &&
+	                           !strchr(backend, '*');
+	if (!explicit_backend)
+		g_setenv("GDK_BACKEND", "x11", TRUE);
+
+	g_once_init_leave(&once, 1);
 }
 
 static int wk_probe(void)
 {
-	pin_gdk_scale();
+	pin_gdk_env();
 	/* This backend is only compiled when pkg-config found webkit2gtk-4.1, so
 	 * reaching this function already proves the library exists. What can still
 	 * be missing at runtime is a display: WebKitGTK will not composite into a
@@ -99,7 +119,7 @@ static int wk_probe(void)
 
 static dwb_backend *wk_create(int width, int height, char **error)
 {
-	pin_gdk_scale();
+	pin_gdk_env();
 	if (!gtk_init_check(NULL, NULL)) {
 		set_error(error, "gtk_init_check failed (no display; try Xvfb)");
 		return NULL;
@@ -205,6 +225,9 @@ typedef struct {
 	char *value;
 	char *error;
 	gboolean done;
+	/* Set by the waiter when it gives up. The callback may still fire after
+	 * that, so it must be able to tell that nobody is listening any more. */
+	gboolean abandoned;
 } eval_ctx;
 
 static void on_eval_finished(GObject *source, GAsyncResult *result, gpointer user_data)
@@ -223,35 +246,61 @@ static void on_eval_finished(GObject *source, GAsyncResult *result, gpointer use
 		g_clear_object(&value);
 	}
 	ctx->done = TRUE;
+	/* If the waiter already returned, the result is dropped and the context is
+	 * freed here. The context cannot be freed on abandonment instead: this
+	 * callback is what still writes into it. */
+	if (ctx->abandoned) {
+		g_free(ctx->value);
+		g_free(ctx->error);
+		g_free(ctx);
+	}
 }
 
 static int wk_evaluate(dwb_backend *backend, const char *js, char **value, char **error)
 {
 	wk_impl *self = backend->impl;
-	eval_ctx ctx = { .done = FALSE };
-
-	webkit_web_view_evaluate_javascript(self->view, js, -1, NULL, NULL, NULL,
-	                                    on_eval_finished, &ctx);
-
-	gint64 deadline = g_get_monotonic_time() + 15 * G_USEC_PER_SEC;
-	while (!ctx.done && g_get_monotonic_time() < deadline)
-		pump(50);
-
-	if (!ctx.done) {
-		set_error(error, "javascript evaluation timed out");
+	/* Heap, not stack. The callback is owned by WebKit and fires whenever it
+	 * fires; on a page that takes longer than the deadline (a media page
+	 * blocked in GStreamer will) the stack frame below is long gone, and the
+	 * callback writing a gboolean and two pointers into it corrupted whatever
+	 * the caller had by then. */
+	eval_ctx *ctx = calloc(1, sizeof(*ctx));
+	if (!ctx) {
+		set_error(error, "out of memory");
 		return -1;
 	}
-	if (ctx.error) {
-		set_error(error, "%s", ctx.error);
-		g_free(ctx.error);
-		g_free(ctx.value);
+
+	webkit_web_view_evaluate_javascript(self->view, js, -1, NULL, NULL, NULL,
+	                                    on_eval_finished, ctx);
+
+	gint64 deadline = g_get_monotonic_time() + 15 * G_USEC_PER_SEC;
+	while (!ctx->done && g_get_monotonic_time() < deadline)
+		pump(50);
+
+	if (!ctx->done) {
+		set_error(error, "javascript evaluation timed out");
+		ctx->abandoned = TRUE;
+		return -1;
+	}
+	if (ctx->error) {
+		set_error(error, "%s", ctx->error);
+		g_free(ctx->error);
+		g_free(ctx->value);
+		g_free(ctx);
 		return -1;
 	}
 	if (value)
-		*value = ctx.value;
+		*value = ctx->value;
 	else
-		g_free(ctx.value);
+		g_free(ctx->value);
+	g_free(ctx);
 	return 0;
+}
+
+static void wk_wait(dwb_backend *backend, int ms)
+{
+	(void)backend;
+	pump(ms);
 }
 
 static int wk_render(dwb_backend *backend, dwb_frame *out, char **error)
@@ -328,4 +377,5 @@ const dwb_backend_ops dwb_backend_webkitgtk = {
 	.resize = wk_resize,
 	.render = wk_render,
 	.evaluate = wk_evaluate,
+	.wait = wk_wait,
 };
